@@ -68,6 +68,9 @@ static void init_thread (struct thread *, const char *name, int priority);
 static bool is_thread (struct thread *) UNUSED;
 static void *alloc_frame (struct thread *, size_t size);
 static void schedule (void);
+static bool thread_priority_more (const struct list_elem *, const struct list_elem *, void *aux UNUSED);
+static void refresh_priority (struct thread *t);
+void thread_donate_priority (struct thread *t);
 void thread_schedule_tail (struct thread *prev);
 static tid_t allocate_tid (void);
 
@@ -147,6 +150,49 @@ thread_print_stats (void)
           idle_ticks, kernel_ticks, user_ticks);
 }
 
+static bool
+thread_priority_more (const struct list_elem *a,
+                      const struct list_elem *b,
+                      void *aux UNUSED)
+{
+  const struct thread *ta = list_entry (a, struct thread, elem);
+  const struct thread *tb = list_entry (b, struct thread, elem);
+  return ta->priority > tb->priority;
+}
+
+/** Recompute effective priority for thread T based on original priority
+    and any threads waiting on locks this thread holds. */
+static void
+refresh_priority (struct thread *t)
+{
+  int max_priority = t->original_priority;
+  struct list_elem *e;
+
+  for (e = list_begin (&all_list); e != list_end (&all_list);
+       e = list_next (e))
+    {
+      struct thread *tt = list_entry (e, struct thread, allelem);
+      if (tt->waiting_lock != NULL && tt->waiting_lock->holder == t)
+        {
+          if (tt->priority > max_priority)
+            max_priority = tt->priority;
+        }
+    }
+
+  t->priority = max_priority;
+}
+
+void
+thread_donate_priority (struct thread *t)
+{
+  if (t == NULL)
+    return;
+
+  refresh_priority (t);
+  if (t->waiting_lock != NULL && t->waiting_lock->holder != NULL)
+    thread_donate_priority (t->waiting_lock->holder);
+}
+
 /** Creates a new kernel thread named NAME with the given initial
    PRIORITY, which executes FUNCTION passing AUX as the argument,
    and adds it to the ready queue.  Returns the thread identifier
@@ -200,6 +246,8 @@ thread_create (const char *name, int priority,
 
   /* Add to run queue. */
   thread_unblock (t);
+  if (thread_current ()->priority < t->priority)
+    thread_yield ();
 
   return tid;
 }
@@ -237,7 +285,7 @@ thread_unblock (struct thread *t)
 
   old_level = intr_disable ();
   ASSERT (t->status == THREAD_BLOCKED);
-  list_push_back (&ready_list, &t->elem);
+  list_insert_ordered (&ready_list, &t->elem, thread_priority_more, NULL);
   t->status = THREAD_READY;
   intr_set_level (old_level);
 }
@@ -307,8 +355,8 @@ thread_yield (void)
   ASSERT (!intr_context ());
 
   old_level = intr_disable ();
-  if (cur != idle_thread) 
-    list_push_back (&ready_list, &cur->elem);
+  if (cur != idle_thread)
+    list_insert_ordered (&ready_list, &cur->elem, thread_priority_more, NULL);
   cur->status = THREAD_READY;
   schedule ();
   intr_set_level (old_level);
@@ -335,7 +383,29 @@ thread_foreach (thread_action_func *func, void *aux)
 void
 thread_set_priority (int new_priority) 
 {
-  thread_current ()->priority = new_priority;
+  struct thread *cur = thread_current ();
+  cur->original_priority = new_priority;
+  thread_donate_priority (cur);
+
+  if (!list_empty (&ready_list))
+    {
+      struct thread *highest = list_entry (list_front (&ready_list), struct thread, elem);
+      if (highest->priority > cur->priority)
+        thread_yield ();
+    }
+}
+
+void
+thread_refresh_priority (void)
+{
+  struct thread *cur = thread_current ();
+  thread_donate_priority (cur);
+  if (!list_empty (&ready_list))
+    {
+      struct thread *highest = list_entry (list_front (&ready_list), struct thread, elem);
+      if (highest->priority > cur->priority)
+        thread_yield ();
+    }
 }
 
 /** Returns the current thread's priority. */
@@ -462,6 +532,12 @@ init_thread (struct thread *t, const char *name, int priority)
   strlcpy (t->name, name, sizeof t->name);
   t->stack = (uint8_t *) t + PGSIZE;
   t->priority = priority;
+  t->original_priority = priority;
+  t->waiting_lock = NULL;
+  t->wake_tick = 0;
+  t->exit_status = 0;
+  list_init (&t->children);
+  t->child_status = NULL;
   t->magic = THREAD_MAGIC;
 
   old_level = intr_disable ();

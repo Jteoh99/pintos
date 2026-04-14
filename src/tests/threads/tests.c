@@ -58,12 +58,15 @@ void
 msg (const char *format, ...) 
 {
   va_list args;
-  
-  printf ("(%s) ", test_name);
+  char buf[256];
+  int n;
+
+  n = snprintf (buf, sizeof buf, "(%s) ", test_name);
   va_start (args, format);
-  vprintf (format, args);
+  vsnprintf (buf + n, sizeof buf - n, format, args);
   va_end (args);
-  putchar ('\n');
+  strlcpy (buf + strlen (buf), "\n", sizeof buf - strlen (buf));
+  printf ("%s", buf);
 }
 
 /** Prints failure message FORMAT as if with printf(),

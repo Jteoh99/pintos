@@ -20,9 +20,15 @@
 /** Number of timer ticks since OS booted. */
 static int64_t ticks;
 
+static struct list sleepers;
+
 /** Number of loops per timer tick.
    Initialized by timer_calibrate(). */
 static unsigned loops_per_tick;
+
+static bool thread_wake_tick_less (const struct list_elem *a,
+                                   const struct list_elem *b,
+                                   void *aux UNUSED);
 
 static intr_handler_func timer_interrupt;
 static bool too_many_loops (unsigned loops);
@@ -32,11 +38,22 @@ static void real_time_delay (int64_t num, int32_t denom);
 
 /** Sets up the timer to interrupt TIMER_FREQ times per second,
    and registers the corresponding interrupt. */
+static bool
+thread_wake_tick_less (const struct list_elem *a,
+                       const struct list_elem *b,
+                       void *aux UNUSED)
+{
+  struct thread *t_a = list_entry (a, struct thread, sleep_elem);
+  struct thread *t_b = list_entry (b, struct thread, sleep_elem);
+  return t_a->wake_tick < t_b->wake_tick;
+}
+
 void
 timer_init (void) 
 {
   pit_configure_channel (0, 2, TIMER_FREQ);
   intr_register_ext (0x20, timer_interrupt, "8254 Timer");
+  list_init (&sleepers);
 }
 
 /** Calibrates loops_per_tick, used to implement brief delays. */
@@ -90,10 +107,18 @@ void
 timer_sleep (int64_t ticks) 
 {
   int64_t start = timer_ticks ();
+  struct thread *cur = thread_current ();
 
   ASSERT (intr_get_level () == INTR_ON);
-  while (timer_elapsed (start) < ticks) 
-    thread_yield ();
+  if (ticks <= 0)
+    return;
+
+  enum intr_level old_level = intr_disable ();
+  cur->wake_tick = start + ticks;
+  list_insert_ordered (&sleepers, &cur->sleep_elem,
+                       thread_wake_tick_less, NULL);
+  thread_block ();
+  intr_set_level (old_level);
 }
 
 /** Sleeps for approximately MS milliseconds.  Interrupts must be
@@ -171,6 +196,14 @@ static void
 timer_interrupt (struct intr_frame *args UNUSED)
 {
   ticks++;
+  while (!list_empty (&sleepers))
+    {
+      struct thread *t = list_entry (list_front (&sleepers), struct thread, sleep_elem);
+      if (t->wake_tick > ticks)
+        break;
+      list_pop_front (&sleepers);
+      thread_unblock (t);
+    }
   thread_tick ();
 }
 

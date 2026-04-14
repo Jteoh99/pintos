@@ -2,6 +2,7 @@
 #include <debug.h>
 #include <inttypes.h>
 #include <round.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -15,8 +16,25 @@
 #include "threads/init.h"
 #include "threads/interrupt.h"
 #include "threads/palloc.h"
+#include "threads/synch.h"
 #include "threads/thread.h"
 #include "threads/vaddr.h"
+
+struct child_status
+  {
+    tid_t tid;                        /**< Child process thread id. */
+    int status;                       /**< Child exit status. */
+    bool exited;                      /**< True if child has exited. */
+    bool waited;                      /**< True if parent already waited. */
+    struct semaphore wait_sema;       /**< Signal child termination to parent. */
+    struct list_elem elem;            /**< List element for parent's child list. */
+  };
+
+struct process_launch_info
+  {
+    char *file_name;
+    struct child_status *cs;
+  };
 
 static thread_func start_process NO_RETURN;
 static bool load (const char *cmdline, void (**eip) (void), void **esp);
@@ -30,6 +48,8 @@ process_execute (const char *file_name)
 {
   char *fn_copy;
   tid_t tid;
+  struct child_status *cs;
+  struct process_launch_info *pli;
 
   /* Make a copy of FILE_NAME.
      Otherwise there's a race between the caller and load(). */
@@ -38,10 +58,40 @@ process_execute (const char *file_name)
     return TID_ERROR;
   strlcpy (fn_copy, file_name, PGSIZE);
 
+  cs = palloc_get_page (0);
+  if (cs == NULL)
+    {
+      palloc_free_page (fn_copy);
+      return TID_ERROR;
+    }
+  sema_init (&cs->wait_sema, 0);
+  cs->tid = TID_ERROR;
+  cs->status = -1;
+  cs->exited = false;
+  cs->waited = false;
+
+  pli = palloc_get_page (0);
+  if (pli == NULL)
+    {
+      palloc_free_page (fn_copy);
+      palloc_free_page (cs);
+      return TID_ERROR;
+    }
+  pli->file_name = fn_copy;
+  pli->cs = cs;
+
   /* Create a new thread to execute FILE_NAME. */
-  tid = thread_create (file_name, PRI_DEFAULT, start_process, fn_copy);
+  tid = thread_create (file_name, PRI_DEFAULT, start_process, pli);
   if (tid == TID_ERROR)
-    palloc_free_page (fn_copy); 
+    {
+      palloc_free_page (fn_copy);
+      palloc_free_page (cs);
+      palloc_free_page (pli);
+      return TID_ERROR;
+    }
+
+  cs->tid = tid;
+  list_push_back (&thread_current ()->children, &cs->elem);
   return tid;
 }
 
@@ -50,9 +100,14 @@ process_execute (const char *file_name)
 static void
 start_process (void *file_name_)
 {
-  char *file_name = file_name_;
+  struct process_launch_info *pli = file_name_;
+  char *file_name = pli->file_name;
+  struct child_status *cs = pli->cs;
   struct intr_frame if_;
   bool success;
+
+  palloc_free_page (pli);
+  thread_current ()->child_status = cs;
 
   /* Initialize interrupt frame and load executable. */
   memset (&if_, 0, sizeof if_);
@@ -64,7 +119,10 @@ start_process (void *file_name_)
   /* If load failed, quit. */
   palloc_free_page (file_name);
   if (!success) 
-    thread_exit ();
+    {
+      thread_current ()->exit_status = -1;
+      thread_exit ();
+    }
 
   /* Start the user process by simulating a return from an
      interrupt, implemented by intr_exit (in
@@ -86,9 +144,34 @@ start_process (void *file_name_)
    This function will be implemented in problem 2-2.  For now, it
    does nothing. */
 int
-process_wait (tid_t child_tid UNUSED) 
+process_wait (tid_t child_tid) 
 {
-  return -1;
+  struct thread *cur = thread_current ();
+  struct list_elem *e;
+  struct child_status *cs = NULL;
+
+  for (e = list_begin (&cur->children); e != list_end (&cur->children);
+       e = list_next (e))
+    {
+      struct child_status *candidate = list_entry (e, struct child_status, elem);
+      if (candidate->tid == child_tid)
+        {
+          cs = candidate;
+          break;
+        }
+    }
+
+  if (cs == NULL || cs->waited)
+    return -1;
+
+  cs->waited = true;
+  if (!cs->exited)
+    sema_down (&cs->wait_sema);
+
+  int status = cs->status;
+  list_remove (&cs->elem);
+  palloc_free_page (cs);
+  return status;
 }
 
 /** Free the current process's resources. */
@@ -97,6 +180,13 @@ process_exit (void)
 {
   struct thread *cur = thread_current ();
   uint32_t *pd;
+
+  if (cur->child_status != NULL)
+    {
+      cur->child_status->status = cur->exit_status;
+      cur->child_status->exited = true;
+      sema_up (&cur->child_status->wait_sema);
+    }
 
   /* Destroy the current process's page directory and switch back
      to the kernel-only page directory. */

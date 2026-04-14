@@ -92,4 +92,6 @@ following license:
  * copyright applies only to those changes made by the copyright
  * holders listed in the AUTHORS file. The rest of this file is covered by
  * the copyright notices, if any, listed below.
+ * docker run -it --rm --name pintos --mount type=bind,source=”C:\Users\jteoh\Dropbox\PC\Documents\GitHub\CSE150\pintos",target=/home/PKUOS/pintos pkuflyingpig/pintos bash
+ * cd /home/PKUOS/pintos/src/threads
  */
